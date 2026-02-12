@@ -11,11 +11,15 @@ function emitE2EEvent(payload) {
 
 test.afterEach(async ({}, testInfo) => {
   const testId = `${testInfo.file} :: ${testInfo.title}`;
+  const errorText = testInfo.error
+    ? `${testInfo.error.message || ''}\n${testInfo.error.stack || ''}`.trim()
+    : null;
   emitE2EEvent({
     type: 'test_end',
     test: testId,
     status: testInfo.status,
     durationMs: testInfo.duration,
+    error: errorText,
   });
 });
 

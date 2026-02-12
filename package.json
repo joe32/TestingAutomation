@@ -4,8 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test:e2e": "playwright test --headed",
-    "runner:start": "node runner.js",
+    "test:e2e": "PLAYWRIGHT_HEADLESS=0 playwright test --headed",
+    "test:e2e:headless": "PLAYWRIGHT_HEADLESS=1 playwright test",
+    "runner:start": "RUNNER_BROWSER_MODE=headed node runner.js",
+    "runner:start:headless": "RUNNER_BROWSER_MODE=headless node runner.js",
+    "runner:start:hostname": "RUNNER_PUBLIC_HOST=testing-automation.local RUNNER_BROWSER_MODE=headed node runner.js",
+    "runner:start:headless:hostname": "RUNNER_PUBLIC_HOST=testing-automation.local RUNNER_BROWSER_MODE=headless node runner.js",
     "runner:trigger": "curl -X POST http://127.0.0.1:5050/trigger",
     "runner:status": "curl http://127.0.0.1:5050/status"
   },
