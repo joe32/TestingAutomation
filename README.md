@@ -1,6 +1,7 @@
 1. downlaod the latest zip file from ["Releases:](https://github.com/joe32/TestingAutomation/releases)
 2. expand it and find the "SETUP" folder inside, open it.
-3. This step only applies if you DONT have HomeBrew installed already: install it using this command:          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"            (you may have to enter your password)
+3. This step only applies if you DONT have HomeBrew installed already: install it using this command: ```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" (you may have to enter your password)
 
 4. double click the "First install-run-ONCE.command" file (only ever run this once, never again). **(it will popup saying it cant be opened) press DONE**
 <img width="372" height="378" alt="image" src="https://github.com/user-attachments/assets/e0b0c88c-5eda-42bd-966d-2ce6a61d0115" />
