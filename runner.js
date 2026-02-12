@@ -1,12 +1,8 @@
 const http = require('http');
 const { spawn } = require('child_process');
-const os = require('os');
 
-const HOST = process.env.RUNNER_HOST || '0.0.0.0';
-const PORT = Number(process.env.RUNNER_PORT || 5050);
-const RUNNER_BROWSER_MODE = (process.env.RUNNER_BROWSER_MODE || 'headed').toLowerCase();
-const RUNNER_PUBLIC_HOST =
-  process.env.RUNNER_PUBLIC_HOST || `${(os.hostname() || 'testing-automation').toLowerCase()}.local`;
+const HOST = '127.0.0.1';
+const PORT = 5050;
 const EXAMPLE_SPEC = 'tests/2. Regression/navigation.spec.js';
 const MAX_LOG_LINES = 2000;
 
@@ -20,7 +16,6 @@ function createIdleState(overrides = {}) {
     exitCode: null,
     lastError: null,
     currentSpec: null,
-    browserMode: RUNNER_BROWSER_MODE === 'headless' ? 'headless' : 'headed',
     currentTest: null,
     currentDetail: null,
     structuredEventsSeen: false,
@@ -31,33 +26,6 @@ function createIdleState(overrides = {}) {
 }
 
 let runState = createIdleState();
-let authState = {
-  awaiting: null, // "credentials" | "otp" | null
-  requestedBy: null,
-  requestedDetail: null,
-  credentials: null, // { email, password }
-  otp: null, // { code }
-  updatedAt: null,
-};
-
-function updateAuthState(patch) {
-  authState = {
-    ...authState,
-    ...patch,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function clearAuthState() {
-  authState = {
-    awaiting: null,
-    requestedBy: null,
-    requestedDetail: null,
-    credentials: null,
-    otp: null,
-    updatedAt: new Date().toISOString(),
-  };
-}
 
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -105,10 +73,21 @@ function upsertTestResult(testName, status, durationMs, error) {
   const updated = {
     test: testName,
     status,
-    durationMs: typeof durationMs === 'number' ? durationMs : (idx >= 0 ? runState.testResults[idx].durationMs : null),
-    error: typeof error === 'string' && error.trim() ? error : (idx >= 0 ? runState.testResults[idx].error || null : null),
+    durationMs:
+      typeof durationMs === 'number'
+        ? durationMs
+        : idx >= 0
+          ? runState.testResults[idx].durationMs
+          : null,
+    error:
+      typeof error === 'string' && error.trim()
+        ? error
+        : idx >= 0
+          ? runState.testResults[idx].error || null
+          : null,
     updatedAt: new Date().toISOString(),
   };
+
   if (idx === -1) runState.testResults.push(updated);
   else runState.testResults[idx] = { ...runState.testResults[idx], ...updated };
 }
@@ -127,6 +106,7 @@ function parseE2EEvent(cleanLine) {
   try {
     const evt = JSON.parse(m[1]);
     if (!evt || !evt.type) return true;
+
     runState.structuredEventsSeen = true;
 
     if (evt.type === 'test_start' && evt.test) {
@@ -164,6 +144,7 @@ function parseOutputLine(rawLine) {
   if (!clean) return;
 
   if (parseE2EEvent(clean)) return;
+
   if (runState.structuredEventsSeen) return;
 
   const currentMatch = clean.match(/\[\d+\/\d+\]\s+(.+?\.spec\.[jt]s(?::\d+:\d+)?\s+[›>]\s+.+)$/);
@@ -225,31 +206,21 @@ function streamOutput(stream, streamName) {
 function startPlaywrightRun(spec) {
   const hasSpec = typeof spec === 'string' && spec.trim().length > 0;
   const targetSpec = hasSpec ? spec.trim() : null;
-  const isHeadless = RUNNER_BROWSER_MODE === 'headless';
   const args = hasSpec
-    ? ['playwright', 'test', targetSpec, '--reporter=line']
-    : ['playwright', 'test', '--reporter=line'];
-  if (!isHeadless) args.push('--headed');
+    ? ['playwright', 'test', targetSpec, '--headed', '--reporter=line']
+    : ['playwright', 'test', '--headed', '--reporter=line'];
 
   runState = createIdleState({
     running: true,
     startedAt: new Date().toISOString(),
     currentSpec: targetSpec || 'ALL',
-    browserMode: isHeadless ? 'headless' : 'headed',
   });
-  clearAuthState();
 
   appendLog(`[runner] Starting Playwright run: npx ${args.join(' ')}`, 'system');
-  console.log(`[runner] Starting Playwright run: npx ${args.join(' ')}`);
 
   currentChild = spawn('npx', args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      PLAYWRIGHT_HEADLESS: isHeadless ? '1' : '0',
-      E2E_HEADLESS: isHeadless ? '1' : '0',
-      RUNNER_INTERNAL_URL: `http://127.0.0.1:${PORT}`,
-    },
+    env: process.env,
   });
 
   streamOutput(currentChild.stdout, 'stdout');
@@ -266,7 +237,6 @@ function startPlaywrightRun(spec) {
     else finalizeAnyRunningTests('failed');
 
     appendLog(`[runner] Playwright finished with exit code: ${code}`, 'system');
-    console.log(`[runner] Playwright finished with exit code: ${code}`);
     currentChild = null;
   });
 
@@ -280,7 +250,6 @@ function startPlaywrightRun(spec) {
     finalizeAnyRunningTests('failed');
 
     appendLog(`[runner] Failed to start Playwright: ${err.message}`, 'system');
-    console.error(`[runner] Failed to start Playwright: ${err.message}`);
     currentChild = null;
   });
 }
@@ -299,7 +268,6 @@ function stopCurrentRun() {
     runState.currentTest = null;
     runState.currentDetail = null;
     finalizeAnyRunningTests('canceled');
-    clearAuthState();
     appendLog('[runner] Run stopped by user', 'system');
     return { ok: true, message: 'Run stop requested.' };
   } catch (err) {
@@ -312,7 +280,6 @@ function clearRunnerState() {
     return { ok: false, message: 'Cannot clear while a run is active. Stop it first.' };
   }
   runState = createIdleState();
-  clearAuthState();
   return { ok: true, message: 'Runner state cleared.' };
 }
 
@@ -320,7 +287,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
 
   if (req.method === 'GET' && url.pathname === '/ui') {
-    return sendHtml(res, 200, `<!doctype html>
+    return sendHtml(
+      res,
+      200,
+      `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -363,13 +333,6 @@ const server = http.createServer(async (req, res) => {
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
       details summary { cursor: pointer; color: #fca5a5; font-weight: 700; }
       .error-box { margin-top: 6px; background: #220f14; border: 1px solid #55202a; border-radius: 6px; padding: 8px; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; font-size: 12px; }
-      .auth-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); display: none; align-items: center; justify-content: center; z-index: 9999; }
-      .auth-modal.show { display: flex; }
-      .auth-card { width: min(520px, 92vw); background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; }
-      .auth-title { margin: 0 0 8px 0; font-size: 20px; }
-      .auth-field { margin-top: 10px; display: grid; gap: 6px; }
-      .auth-help { color: #9ca3af; font-size: 13px; margin-top: 6px; }
-      .auth-actions { margin-top: 14px; display: flex; gap: 10px; }
       @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     </style>
   </head>
@@ -393,7 +356,6 @@ const server = http.createServer(async (req, res) => {
         <div class="card">
           <h3 style="margin-top:0;">Run State</h3>
           <div class="kv"><strong>Current Spec:</strong> <span id="currentSpec" class="mono">-</span></div>
-          <div class="kv"><strong>Browser Mode:</strong> <span id="browserMode" class="mono">-</span></div>
           <div class="kv"><strong>Current Test:</strong> <span id="currentTest" class="mono">-</span></div>
           <div class="kv"><strong>Current Detail:</strong> <span id="currentDetail" class="mono">-</span></div>
           <div class="kv"><strong>Started:</strong> <span id="startedAt" class="mono">-</span></div>
@@ -421,37 +383,6 @@ const server = http.createServer(async (req, res) => {
       </div>
     </div>
 
-    <div id="authModal" class="auth-modal">
-      <div class="auth-card">
-        <h3 class="auth-title" id="authTitle">Authentication Required</h3>
-        <div class="auth-help" id="authHelp">Provide requested authentication data to continue headless run.</div>
-
-        <div id="credentialsForm" style="display:none;">
-          <div class="auth-field">
-            <label for="authEmail">Email</label>
-            <input id="authEmail" type="email" autocomplete="username" />
-          </div>
-          <div class="auth-field">
-            <label for="authPassword">Password</label>
-            <input id="authPassword" type="password" autocomplete="current-password" />
-          </div>
-          <div class="auth-actions">
-            <button id="submitCredentials" type="button">Send Credentials</button>
-          </div>
-        </div>
-
-        <div id="otpForm" style="display:none;">
-          <div class="auth-field">
-            <label for="authOtp">Authentication Code</label>
-            <input id="authOtp" type="text" inputmode="numeric" autocomplete="one-time-code" />
-          </div>
-          <div class="auth-actions">
-            <button id="submitOtp" type="button">Send Code</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <script>
       const statusBadge = document.getElementById('statusBadge');
       const statusText = document.getElementById('statusText');
@@ -460,16 +391,6 @@ const server = http.createServer(async (req, res) => {
       const clearBtn = document.getElementById('clear');
       const specInput = document.getElementById('spec');
       const logsPre = document.getElementById('logs');
-      const authModal = document.getElementById('authModal');
-      const authTitle = document.getElementById('authTitle');
-      const authHelp = document.getElementById('authHelp');
-      const credentialsForm = document.getElementById('credentialsForm');
-      const otpForm = document.getElementById('otpForm');
-      const authEmail = document.getElementById('authEmail');
-      const authPassword = document.getElementById('authPassword');
-      const authOtp = document.getElementById('authOtp');
-      const submitCredentialsBtn = document.getElementById('submitCredentials');
-      const submitOtpBtn = document.getElementById('submitOtp');
 
       function statusClass(state) {
         if (state.running) return 'running';
@@ -510,6 +431,7 @@ const server = http.createServer(async (req, res) => {
           const errorHtml = r.error
             ? '<details><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>'
             : '';
+
           return '<tr>' +
             '<td class="mono">' + esc(r.test) + errorHtml + '</td>' +
             '<td><span class="badge ' + cls + '">' + esc(r.status).toUpperCase() + '</span></td>' +
@@ -527,87 +449,10 @@ const server = http.createServer(async (req, res) => {
         logsPre.scrollTop = logsPre.scrollHeight;
       }
 
-      function setAuthMode(auth) {
-        const awaiting = auth && auth.awaiting ? auth.awaiting : null;
-        if (!awaiting) {
-          authModal.classList.remove('show');
-          credentialsForm.style.display = 'none';
-          otpForm.style.display = 'none';
-          return;
-        }
-
-        authModal.classList.add('show');
-        if (awaiting === 'credentials') {
-          authTitle.textContent = 'Login Required';
-          authHelp.textContent = (auth && auth.requestedDetail) ? auth.requestedDetail : 'Enter email and password for the test login.';
-          credentialsForm.style.display = 'block';
-          otpForm.style.display = 'none';
-          authEmail.focus();
-        } else if (awaiting === 'otp') {
-          authTitle.textContent = 'Authentication Code Required';
-          authHelp.textContent = (auth && auth.requestedDetail) ? auth.requestedDetail : 'Enter the one-time authentication code.';
-          credentialsForm.style.display = 'none';
-          otpForm.style.display = 'block';
-          authOtp.focus();
-        }
-      }
-
-      async function submitCredentials() {
-        const email = authEmail.value.trim();
-        const password = authPassword.value;
-        if (!email || !password) {
-          alert('Email and password are required.');
-          return;
-        }
-        submitCredentialsBtn.disabled = true;
-        try {
-          const res = await fetch('/auth/credentials', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password }),
-          });
-          const data = await res.json();
-          if (!res.ok) {
-            alert(data.message || 'Failed to submit credentials');
-            return;
-          }
-          authPassword.value = '';
-          await refreshStatus();
-        } finally {
-          submitCredentialsBtn.disabled = false;
-        }
-      }
-
-      async function submitOtp() {
-        const code = authOtp.value.trim();
-        if (!code) {
-          alert('Authentication code is required.');
-          return;
-        }
-        submitOtpBtn.disabled = true;
-        try {
-          const res = await fetch('/auth/otp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code }),
-          });
-          const data = await res.json();
-          if (!res.ok) {
-            alert(data.message || 'Failed to submit code');
-            return;
-          }
-          authOtp.value = '';
-          await refreshStatus();
-        } finally {
-          submitOtpBtn.disabled = false;
-        }
-      }
-
       async function refreshStatus() {
-        let res;
         let data;
         try {
-          res = await fetch('/status');
+          const res = await fetch('/status');
           data = await res.json();
         } catch (err) {
           statusBadge.className = 'badge failed';
@@ -624,7 +469,6 @@ const server = http.createServer(async (req, res) => {
           : ('Last run exit code: ' + safe(data.exitCode));
 
         document.getElementById('currentSpec').textContent = safe(data.currentSpec);
-        document.getElementById('browserMode').textContent = safe(data.browserMode);
         document.getElementById('currentTest').textContent = safe(data.currentTest);
         document.getElementById('currentDetail').textContent = safe(data.currentDetail);
         document.getElementById('startedAt').textContent = safe(data.startedAt);
@@ -634,7 +478,6 @@ const server = http.createServer(async (req, res) => {
 
         renderResults(data.testResults);
         renderLogs(data.logs);
-        setAuthMode(data.auth);
 
         runBtn.disabled = !!data.running;
         stopBtn.disabled = !data.running;
@@ -696,120 +539,25 @@ const server = http.createServer(async (req, res) => {
       runBtn.addEventListener('click', trigger);
       stopBtn.addEventListener('click', stopRun);
       clearBtn.addEventListener('click', clearState);
-      submitCredentialsBtn.addEventListener('click', submitCredentials);
-      submitOtpBtn.addEventListener('click', submitOtp);
       refreshStatus();
       setInterval(refreshStatus, 500);
     </script>
   </body>
-</html>`);
+</html>`
+    );
   }
 
   if (req.method === 'GET' && url.pathname === '/status') {
     return sendJson(res, 200, {
       ok: true,
       ...runState,
-      auth: {
-        awaiting: authState.awaiting,
-        requestedBy: authState.requestedBy,
-        requestedDetail: authState.requestedDetail,
-        hasCredentials: !!authState.credentials,
-        hasOtp: !!authState.otp,
-        updatedAt: authState.updatedAt,
-      },
-      publicHost: RUNNER_PUBLIC_HOST,
-      dashboardUrl: `http://${RUNNER_PUBLIC_HOST}:${PORT}/ui`,
       usage: {
         triggerAll: `curl -X POST http://${HOST}:${PORT}/trigger`,
         triggerWithSpec: `curl -X POST http://${HOST}:${PORT}/trigger -H "Content-Type: application/json" -d '{"spec":"${EXAMPLE_SPEC}"}'`,
         stop: `curl http://${HOST}:${PORT}/stop`,
         clear: `curl http://${HOST}:${PORT}/clear`,
-        authCredentials: `curl -X POST http://${HOST}:${PORT}/auth/credentials -H "Content-Type: application/json" -d '{"email":"you@example.com","password":"***"}'`,
-        authOtp: `curl -X POST http://${HOST}:${PORT}/auth/otp -H "Content-Type: application/json" -d '{"code":"123456"}'`,
       },
     });
-  }
-
-  if (req.method === 'POST' && url.pathname === '/auth/request') {
-    try {
-      const body = await parseJsonBody(req);
-      const kind = body.kind === 'otp' ? 'otp' : body.kind === 'credentials' ? 'credentials' : null;
-      if (!kind) return sendJson(res, 400, { ok: false, message: 'Invalid auth request kind.' });
-
-      updateAuthState({
-        awaiting: kind,
-        requestedBy: body.test || null,
-        requestedDetail: body.detail || null,
-      });
-      return sendJson(res, 200, { ok: true, awaiting: authState.awaiting });
-    } catch (err) {
-      return sendJson(res, 400, { ok: false, message: err.message });
-    }
-  }
-
-  if (req.method === 'POST' && url.pathname === '/auth/credentials') {
-    try {
-      const body = await parseJsonBody(req);
-      const email = typeof body.email === 'string' ? body.email.trim() : '';
-      const password = typeof body.password === 'string' ? body.password : '';
-      if (!email || !password) return sendJson(res, 400, { ok: false, message: 'Email and password are required.' });
-
-      updateAuthState({
-        credentials: { email, password },
-      });
-      return sendJson(res, 200, { ok: true, message: 'Credentials received.' });
-    } catch (err) {
-      return sendJson(res, 400, { ok: false, message: err.message });
-    }
-  }
-
-  if (req.method === 'POST' && url.pathname === '/auth/otp') {
-    try {
-      const body = await parseJsonBody(req);
-      const code = typeof body.code === 'string' ? body.code.trim() : '';
-      if (!code) return sendJson(res, 400, { ok: false, message: 'Authentication code is required.' });
-
-      updateAuthState({
-        otp: { code },
-      });
-      return sendJson(res, 200, { ok: true, message: 'Authentication code received.' });
-    } catch (err) {
-      return sendJson(res, 400, { ok: false, message: err.message });
-    }
-  }
-
-  if (req.method === 'GET' && url.pathname === '/auth/consume') {
-    const kind = url.searchParams.get('kind');
-    if (kind === 'credentials') {
-      const value = authState.credentials;
-      if (!value) return sendJson(res, 200, { ok: true, available: false });
-      updateAuthState({
-        awaiting: null,
-        requestedBy: null,
-        requestedDetail: null,
-        credentials: null,
-      });
-      return sendJson(res, 200, { ok: true, available: true, email: value.email, password: value.password });
-    }
-
-    if (kind === 'otp') {
-      const value = authState.otp;
-      if (!value) return sendJson(res, 200, { ok: true, available: false });
-      updateAuthState({
-        awaiting: null,
-        requestedBy: null,
-        requestedDetail: null,
-        otp: null,
-      });
-      return sendJson(res, 200, { ok: true, available: true, code: value.code });
-    }
-
-    return sendJson(res, 400, { ok: false, message: 'Invalid consume kind.' });
-  }
-
-  if (req.method === 'GET' && url.pathname === '/auth/clear') {
-    clearAuthState();
-    return sendJson(res, 200, { ok: true, message: 'Auth state cleared.' });
   }
 
   if (req.method === 'GET' && url.pathname === '/trigger') {
@@ -850,19 +598,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       message: 'Runner is alive.',
-      endpoints: [
-        'GET /status',
-        'GET /ui',
-        'GET /trigger',
-        'POST /trigger',
-        'GET /stop',
-        'GET /clear',
-        'POST /auth/request',
-        'POST /auth/credentials',
-        'POST /auth/otp',
-        'GET /auth/consume?kind=credentials|otp',
-        'GET /auth/clear',
-      ],
+      endpoints: ['GET /status', 'GET /ui', 'GET /trigger', 'POST /trigger', 'GET /stop', 'GET /clear'],
     });
   }
 
@@ -870,20 +606,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  const nets = os.networkInterfaces();
-  const ipv4 = [];
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) ipv4.push(net.address);
-    }
-  }
-
-  console.log(`[runner] Listening on http://${HOST}:${PORT}`);
-  console.log(`[runner] Browser mode: ${RUNNER_BROWSER_MODE === 'headless' ? 'headless' : 'headed'}`);
-  console.log(`[runner] Open dashboard (local): http://127.0.0.1:${PORT}/ui`);
-  console.log(`[runner] Open dashboard (hostname): http://${RUNNER_PUBLIC_HOST}:${PORT}/ui`);
-  if (ipv4.length) {
-    console.log(`[runner] Open dashboard (LAN):   http://${ipv4[0]}:${PORT}/ui`);
-  }
-  console.log(`[runner] Trigger all:    curl -X POST http://${HOST}:${PORT}/trigger`);
+  console.log(`[runner] Open dashboard (local): http://127.0.0.1:5050/ui`);
 });
