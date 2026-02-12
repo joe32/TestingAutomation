@@ -1,7 +1,7 @@
 1. downlaod the latest zip file from ["Releases:](https://github.com/joe32/TestingAutomation/releases)
 2. expand it and find the "SETUP" folder inside, open it.
 3. This step only applies if you DONT have HomeBrew installed already: install it using this command: ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" (you may have to enter your password)```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" (you may have to enter your password)``` 
 
 4. double click the "First install-run-ONCE.command" file (only ever run this once, never again). **(it will popup saying it cant be opened) press DONE**
 <img width="372" height="378" alt="image" src="https://github.com/user-attachments/assets/e0b0c88c-5eda-42bd-966d-2ce6a61d0115" />
@@ -16,7 +16,7 @@
 <img width="1624" height="1061" alt="image" src="https://github.com/user-attachments/assets/4ac210f8-bb99-4bbf-83af-4a51c857d09c" />
 
 9. login and go to the desired project to test. Then press "start tests" in the bottom right hand corner.
-10. check status in the UI dashboard we opened earlier
+10. check status in the UI dashboard we opened earlier.
 <img width="1394" height="912" alt="image" src="https://github.com/user-attachments/assets/b6e92632-5f63-416b-aa77-e59829291fc3" />
 <img width="1624" height="1061" alt="image" src="https://github.com/user-attachments/assets/7b41414e-5d3e-4885-87ab-5dc99a15fbd6" />
 
