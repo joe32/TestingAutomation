@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:e2e": "playwright test --headed",
+    "runner:start": "node runner.js",
+    "runner:trigger": "curl -X POST http://127.0.0.1:5050/trigger",
+    "runner:status": "curl http://127.0.0.1:5050/status"
   },
   "repository": {
     "type": "git",
