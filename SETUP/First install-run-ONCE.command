@@ -16,4 +16,7 @@ brew install node
 # Install project dependencies.
 npm install
 
-echo "Setup complete. Node and npm dependencies installed."
+# Install Playwright browsers required for local runs.
+npx playwright install
+
+echo "Setup complete. Node, npm packages, and Playwright browsers installed."
