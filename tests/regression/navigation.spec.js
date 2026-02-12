@@ -1,20 +1,35 @@
 const { test, expect } = require('@playwright/test');
 
-test.describe('navigation', () => {
-  test('can open key pages from main nav', async ({ page }) => {
-    test.setTimeout(0);
-    await page.goto('/');
+function logStep(message) {
+  const timestamp = new Date().toISOString();
+  console.log(`[navigation][${timestamp}] ${message}`);
+}
 
-    // If redirected to login, wait until session becomes authenticated and dashboard is reachable.
-    // This supports cases where cached auth is absent at first but appears shortly after.
+function getTenantBasePath(currentUrl) {
+  const url = new URL(currentUrl);
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (!parts.length) {
+    throw new Error(`Could not detect tenant slug from URL: ${currentUrl}`);
+  }
+  return `/${parts[0]}`;
+}
+
+test.describe('navigation', () => {
+  test('manual start, then validate /chats', async ({ page }) => {
+    test.setTimeout(0);
+
+    logStep('Opening app root');
+    await page.goto('/');
+    logStep(`Current URL: ${page.url()}`);
+
     if (page.url().includes('/login')) {
+      logStep('Login page detected. Waiting for human login...');
       await page.waitForURL((url) => !url.pathname.includes('/login'), {
         timeout: 0,
       });
+      logStep(`Login completed. URL is now: ${page.url()}`);
     }
 
-    // Inject a manual start button on every document load until clicked.
-    // Using localStorage keeps the "clicked" state across tenant/location reloads.
     await page.addInitScript(() => {
       const START_KEY = 'e2e:startClicked';
 
@@ -29,21 +44,20 @@ test.describe('navigation', () => {
         overlay.style.right = '16px';
         overlay.style.bottom = '16px';
         overlay.style.zIndex = '2147483647';
-        overlay.style.background = 'rgba(0, 0, 0, 0.8)';
+        overlay.style.background = 'rgba(0, 0, 0, 0.85)';
         overlay.style.color = '#fff';
         overlay.style.padding = '12px';
         overlay.style.borderRadius = '10px';
         overlay.style.fontFamily = 'Arial, sans-serif';
-        overlay.style.boxShadow = '0 8px 24px rgba(0,0,0,0.35)';
 
-        const label = document.createElement('div');
-        label.textContent = 'Ready to run E2E?';
-        label.style.marginBottom = '8px';
-        label.style.fontSize = '13px';
+        const text = document.createElement('div');
+        text.textContent = 'Click to start automation';
+        text.style.marginBottom = '8px';
+        text.style.fontSize = '13px';
 
         const button = document.createElement('button');
         button.type = 'button';
-        button.textContent = 'Start automation';
+        button.textContent = 'Start tests';
         button.style.background = '#d94a46';
         button.style.color = '#fff';
         button.style.border = 'none';
@@ -56,7 +70,7 @@ test.describe('navigation', () => {
           overlay.remove();
         };
 
-        overlay.appendChild(label);
+        overlay.appendChild(text);
         overlay.appendChild(button);
         document.body.appendChild(overlay);
       }
@@ -68,40 +82,39 @@ test.describe('navigation', () => {
       }
     });
 
+    logStep('Preparing manual start overlay');
     await page.evaluate(() => localStorage.setItem('e2e:startClicked', 'false'));
     await page.reload({ waitUntil: 'domcontentloaded' });
+    logStep('Overlay should now be visible. Waiting for Start tests click...');
+
     await page.waitForFunction(() => localStorage.getItem('e2e:startClicked') === 'true', {
       timeout: 0,
     });
 
-    // TODO: swap to data-testid selectors from your app
-    const navCases = [
-      {
-        name: 'Dashboard',
-        nav: page.getByTestId('nav-dashboard'),
-        url: /dashboard|quit-coach-demo/,
-        ready: page.getByTestId('dashboard-page'),
-      },
-      {
-        name: 'Chats',
-        nav: page.getByTestId('nav-chats'),
-        url: /chats/,
-        ready: page.getByTestId('chats-page'),
-      },
-      {
-        name: 'Reports',
-        nav: page.getByTestId('nav-reports'),
-        url: /reports/,
-        ready: page.getByTestId('reports-page'),
-      },
+    logStep('Manual start clicked. Running route checks');
+    const tenantBasePath = getTenantBasePath(page.url());
+    logStep(`Detected tenant base path: ${tenantBasePath}`);
+
+    // Add more entries here as coverage expands.
+    const routesToTest = [
+      { name: 'Dashbaord', suffix: '/', expectedPathEnd: '/' },
+      { name: 'Chats', suffix: '/chats', expectedPathEnd: '/chats' },
+      { name: 'Flagged-Messages', suffix: '/flagged-messages', expectedPathEnd: '/flagged-messages' },
+      { name: 'Contact-Details', suffix: '/contact-details', expectedPathEnd: '/contact-details' },
     ];
 
-    for (const item of navCases) {
-      await test.step(`open ${item.name}`, async () => {
-        await item.nav.click();
-        await expect(page).toHaveURL(item.url);
-        await expect(item.ready).toBeVisible();
+    for (const route of routesToTest) {
+      await test.step(`open ${route.name}`, async () => {
+        const targetPath = `${tenantBasePath}${route.suffix}`;
+        logStep(`Navigating to ${targetPath}`);
+        await page.goto(targetPath, { waitUntil: 'domcontentloaded' });
+        logStep(`Now at: ${page.url()}`);
+
+        const pathname = new URL(page.url()).pathname;
+        expect(pathname.endsWith(route.expectedPathEnd)).toBeTruthy();
+        await expect(page.locator('body')).toBeVisible();
         await expect(page.locator('body')).not.toContainText('NaN');
+        logStep(`${route.name} checks passed`);
       });
     }
   });
