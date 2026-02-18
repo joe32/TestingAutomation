@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../shared-fixture');
 // Regression spec ordering:
 // 10-*.spec.js runs before 20-*.spec.js, then 30-*.spec.js, etc.
 // To add the next flow, copy this file and name it like 30-<feature>.spec.js.
@@ -84,7 +84,7 @@ test.afterEach(async ({}, testInfo) => {
 });
 
 test.describe('chats tabs', () => {
-  test('load /chats and switch Whatsapp -> Web -> All', async ({ page }) => {
+  test('load /chats and switch Whatsapp -> Web -> All', async ({ sharedPage: page }) => {
     test.setTimeout(0);
     const testInfo = test.info();
     const testId = `${testInfo.file} :: ${testInfo.title}`;

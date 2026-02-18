@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../shared-fixture');
 
 function logStep(message) {
   const timestamp = new Date().toISOString();
@@ -23,7 +23,7 @@ test.afterEach(async ({}, testInfo) => {
   });
 });
 
-test('smoke: app loads with no critical errors', async ({ page }) => {
+test('smoke: app loads with no critical errors', async ({ sharedPage: page }) => {
   const consoleErrors = [];
   const serverErrors = [];
   const testInfo = test.info();

@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../shared-fixture');
 
 function logStep(message) {
   const timestamp = new Date().toISOString();
@@ -93,7 +93,7 @@ test.afterEach(async ({}, testInfo) => {
 });
 
 test.describe('navigation', () => {
-  test('manual start, then validate all dashboard View links', async ({ page }) => {
+  test('manual start, then validate all dashboard View links', async ({ sharedPage: page }) => {
     test.setTimeout(0);
     const testInfo = test.info();
     const testId = `${testInfo.file} :: ${testInfo.title}`;
