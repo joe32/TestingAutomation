@@ -1,4 +1,6 @@
 const { test, expect } = require('../shared-fixture');
+// @runner-name: Smoke
+// @runner-children: smoke.core=Check app loads with no critical errors
 
 function logStep(message) {
   const timestamp = new Date().toISOString();
@@ -7,6 +9,12 @@ function logStep(message) {
 
 function emitE2EEvent(payload) {
   console.log(`[E2E_EVENT] ${JSON.stringify(payload)}`);
+}
+
+function selectedTasks() {
+  const raw = process.env.RUNNER_TASKS || '';
+  const items = raw.split(',').map((x) => x.trim()).filter(Boolean);
+  return items.length ? new Set(items) : null;
 }
 
 test.afterEach(async ({}, testInfo) => {
@@ -24,6 +32,11 @@ test.afterEach(async ({}, testInfo) => {
 });
 
 test('smoke: app loads with no critical errors', async ({ sharedPage: page }) => {
+  const tasks = selectedTasks();
+  if (tasks && !tasks.has('smoke.core')) {
+    test.skip(true, 'smoke.core not selected for this run');
+  }
+
   const consoleErrors = [];
   const serverErrors = [];
   const testInfo = test.info();

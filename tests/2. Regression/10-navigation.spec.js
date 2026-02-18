@@ -1,4 +1,6 @@
 const { test, expect } = require('../shared-fixture');
+// @runner-name: Dashboard
+// @runner-children: dashboard.load=Check dashboard loads (Required);dashboard.links=Validate dashboard View links
 
 function logStep(message) {
   const timestamp = new Date().toISOString();
@@ -7,6 +9,16 @@ function logStep(message) {
 
 function emitE2EEvent(payload) {
   console.log(`[E2E_EVENT] ${JSON.stringify(payload)}`);
+}
+
+function selectedTasks() {
+  const raw = process.env.RUNNER_TASKS || '';
+  const items = raw.split(',').map((x) => x.trim()).filter(Boolean);
+  return items.length ? new Set(items) : null;
+}
+
+function shouldRunTask(tasks, taskId) {
+  return !tasks || tasks.has(taskId);
 }
 
 function getTenantBasePath(currentUrl) {
@@ -95,6 +107,13 @@ test.afterEach(async ({}, testInfo) => {
 test.describe('navigation', () => {
   test('manual start, then validate all dashboard View links', async ({ sharedPage: page }) => {
     test.setTimeout(0);
+    const tasks = selectedTasks();
+    const runDashboardLoad = shouldRunTask(tasks, 'dashboard.load');
+    const runDashboardLinks = shouldRunTask(tasks, 'dashboard.links');
+    if (!runDashboardLoad && !runDashboardLinks) {
+      test.skip(true, 'No dashboard tasks selected for this run');
+    }
+
     const testInfo = test.info();
     const testId = `${testInfo.file} :: ${testInfo.title}`;
 
@@ -188,31 +207,45 @@ test.describe('navigation', () => {
 
     const dashboardPath = `${tenantBasePath}`;
     await page.goto(dashboardPath, { waitUntil: 'domcontentloaded' });
-    await expect(page.locator('body')).toBeVisible();
+    let initialViewCount = 0;
 
-    const dashboardHeader = page.getByRole('heading', { name: /dashboard/i });
-    await expect(dashboardHeader, 'Dashboard heading did not render before scanning View links.').toBeVisible();
+    if (runDashboardLoad) {
+      emitE2EEvent({ type: 'subtest_start', test: testId, subtestId: 'dashboard.load', subtestName: 'Check dashboard loads (Required)' });
+      try {
+        await expect(page.locator('body')).toBeVisible();
+        const dashboardHeader = page.getByRole('heading', { name: /dashboard/i }).first();
+        await expect(dashboardHeader, 'Dashboard heading did not render.').toBeVisible();
+        emitE2EEvent({ type: 'subtest_end', test: testId, subtestId: 'dashboard.load', status: 'passed' });
+      } catch (err) {
+        emitE2EEvent({ type: 'subtest_end', test: testId, subtestId: 'dashboard.load', status: 'failed', error: String(err && err.stack ? err.stack : err) });
+        throw err;
+      }
+    }
 
-    const initialTargets = await waitForDashboardViewTargets(page, 30000);
-    const initialViewCount = initialTargets.length;
-    expect(
-      initialViewCount,
-      `No Dashboard View controls found. url=${page.url()}`
-    ).toBeGreaterThan(0);
+    if (!runDashboardLinks) return;
 
-    logStep(`Found ${initialViewCount} Dashboard View buttons`);
-    emitE2EEvent({ type: 'step', test: testId, detail: `Found ${initialViewCount} Dashboard View buttons` });
+    emitE2EEvent({ type: 'subtest_start', test: testId, subtestId: 'dashboard.links', subtestName: 'Validate dashboard View links' });
+    try {
+      const initialTargets = await waitForDashboardViewTargets(page, 30000);
+      initialViewCount = initialTargets.length;
+      expect(
+        initialViewCount,
+        `No Dashboard View controls found. url=${page.url()}`
+      ).toBeGreaterThan(0);
 
-    for (let i = 0; i < initialViewCount; i += 1) {
-      await test.step(`open Dashboard View #${i + 1}`, async () => {
-        await page.goto(dashboardPath, { waitUntil: 'domcontentloaded' });
+      logStep(`Found ${initialViewCount} Dashboard View buttons`);
+      emitE2EEvent({ type: 'step', test: testId, detail: `Found ${initialViewCount} Dashboard View buttons` });
 
-        const currentTargets = await waitForDashboardViewTargets(page, 15000);
-        const currentCount = currentTargets.length;
-        expect(
-          currentCount,
-          `Dashboard View #${i + 1} missing: expected at least ${i + 1} visible View buttons, found ${currentCount}`
-        ).toBeGreaterThan(i);
+      for (let i = 0; i < initialViewCount; i += 1) {
+        await test.step(`open Dashboard View #${i + 1}`, async () => {
+          await page.goto(dashboardPath, { waitUntil: 'domcontentloaded' });
+
+          const currentTargets = await waitForDashboardViewTargets(page, 15000);
+          const currentCount = currentTargets.length;
+          expect(
+            currentCount,
+            `Dashboard View #${i + 1} missing: expected at least ${i + 1} visible View buttons, found ${currentCount}`
+          ).toBeGreaterThan(i);
 
         const currentUrl = page.url();
         const view = currentTargets[i];
@@ -301,7 +334,12 @@ test.describe('navigation', () => {
 
         logStep(`Dashboard View #${i + 1} loaded successfully at ${destinationUrl} via ${navMethod}`);
         emitE2EEvent({ type: 'step', test: testId, detail: `Dashboard View #${i + 1} loaded successfully at ${destinationUrl} via ${navMethod}` });
-      });
+        });
+      }
+      emitE2EEvent({ type: 'subtest_end', test: testId, subtestId: 'dashboard.links', status: 'passed' });
+    } catch (err) {
+      emitE2EEvent({ type: 'subtest_end', test: testId, subtestId: 'dashboard.links', status: 'failed', error: String(err && err.stack ? err.stack : err) });
+      throw err;
     }
   });
 });

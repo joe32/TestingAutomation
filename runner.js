@@ -1,10 +1,15 @@
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { spawn } = require('child_process');
 
 const HOST = '127.0.0.1';
 const PORT = 5050;
 const EXAMPLE_SPEC = 'tests/2. Regression/10-navigation.spec.js';
 const MAX_LOG_LINES = 2000;
+const TESTS_DIR = path.join(__dirname, 'tests');
+const RUNNER_NAME_RE = /@runner-name:\s*(.+)$/im;
+const RUNNER_CHILDREN_RE = /@runner-children:\s*(.+)$/im;
 
 let currentChild = null;
 
@@ -16,9 +21,10 @@ function createIdleState(overrides = {}) {
     exitCode: null,
     lastError: null,
     currentSpec: null,
+    selectedSpecs: [],
+    selectedTasks: [],
     currentTest: null,
     currentDetail: null,
-    structuredEventsSeen: false,
     testResults: [],
     logs: [],
     ...overrides,
@@ -68,10 +74,11 @@ function appendLog(line, stream = 'stdout') {
   }
 }
 
-function upsertTestResult(testName, status, durationMs, error) {
-  const idx = runState.testResults.findIndex((x) => x.test === testName);
+function upsertTestResult(key, status, durationMs, error, testNameOverride) {
+  const idx = runState.testResults.findIndex((x) => x.key === key);
   const updated = {
-    test: testName,
+    key,
+    test: testNameOverride || key,
     status,
     durationMs:
       typeof durationMs === 'number'
@@ -99,6 +106,13 @@ function finalizeAnyRunningTests(status) {
   });
 }
 
+function extractSpecIdFromEventTest(rawTest) {
+  const clean = String(rawTest || '');
+  const m = clean.match(/tests[\\/].+?\.spec\.[jt]s/i);
+  if (!m) return null;
+  return m[0].replaceAll('\\', '/');
+}
+
 function parseE2EEvent(cleanLine) {
   const m = cleanLine.match(/\[E2E_EVENT\]\s+(.+)$/);
   if (!m) return false;
@@ -107,25 +121,57 @@ function parseE2EEvent(cleanLine) {
     const evt = JSON.parse(m[1]);
     if (!evt || !evt.type) return true;
 
-    runState.structuredEventsSeen = true;
-
     if (evt.type === 'test_start' && evt.test) {
       runState.currentTest = evt.test;
       runState.currentDetail = 'Starting test';
-      upsertTestResult(evt.test, 'running');
+      const specId = extractSpecIdFromEventTest(evt.test);
+      const key = `${specId || evt.test}::__self`;
+      const hasSubtestsPlanned = runState.testResults.some((r) => String(r.key || '').startsWith(`${specId}::`) && !String(r.key).endsWith('::__self'));
+      if (!hasSubtestsPlanned) {
+        upsertTestResult(key, 'running', null, null, evt.test);
+      }
       return true;
     }
 
     if (evt.type === 'step' && evt.test) {
-      runState.currentTest = evt.test;
+      if (!runState.currentTest) runState.currentTest = evt.test;
       runState.currentDetail = evt.detail || null;
-      upsertTestResult(evt.test, 'running');
+      return true;
+    }
+
+    if (evt.type === 'subtest_start' && evt.test && evt.subtestId) {
+      const specId = extractSpecIdFromEventTest(evt.test);
+      const key = `${specId || evt.test}::${evt.subtestId}`;
+      const label = evt.subtestName || evt.subtestId;
+      runState.currentTest = label;
+      runState.currentDetail = `Running ${label}`;
+      upsertTestResult(key, 'running', null, null, label);
+      return true;
+    }
+
+    if (evt.type === 'subtest_end' && evt.test && evt.subtestId) {
+      const specId = extractSpecIdFromEventTest(evt.test);
+      const key = `${specId || evt.test}::${evt.subtestId}`;
+      const mapped = evt.status === 'passed' ? 'passed' : evt.status === 'skipped' ? 'canceled' : 'failed';
+      upsertTestResult(key, mapped, typeof evt.durationMs === 'number' ? evt.durationMs : null, evt.error || null);
       return true;
     }
 
     if (evt.type === 'test_end' && evt.test) {
       const mapped = evt.status === 'passed' ? 'passed' : evt.status === 'skipped' ? 'canceled' : 'failed';
-      upsertTestResult(evt.test, mapped, typeof evt.durationMs === 'number' ? evt.durationMs : null, evt.error || null);
+      const specId = extractSpecIdFromEventTest(evt.test);
+      const key = `${specId || evt.test}::__self`;
+      const hasSubtestsPlanned = runState.testResults.some((r) => String(r.key || '').startsWith(`${specId}::`) && !String(r.key).endsWith('::__self'));
+      if (!hasSubtestsPlanned) {
+        upsertTestResult(key, mapped, typeof evt.durationMs === 'number' ? evt.durationMs : null, evt.error || null, evt.test);
+      } else if (specId) {
+        runState.testResults = runState.testResults.map((r) => {
+          if (!String(r.key || '').startsWith(`${specId}::`)) return r;
+          if (String(r.key).endsWith('::__self')) return r;
+          if (r.status !== 'pending' && r.status !== 'running') return r;
+          return { ...r, status: mapped, error: mapped === 'failed' ? (evt.error || r.error || null) : r.error };
+        });
+      }
       if (runState.currentTest === evt.test) {
         runState.currentTest = null;
         runState.currentDetail = null;
@@ -144,39 +190,6 @@ function parseOutputLine(rawLine) {
   if (!clean) return;
 
   if (parseE2EEvent(clean)) return;
-
-  if (runState.structuredEventsSeen) return;
-
-  const currentMatch = clean.match(/\[\d+\/\d+\]\s+(.+?\.spec\.[jt]s(?::\d+:\d+)?\s+[›>]\s+.+)$/);
-  if (currentMatch) {
-    runState.currentTest = currentMatch[1].trim();
-    runState.currentDetail = 'Playwright reporter running';
-    upsertTestResult(runState.currentTest, 'running');
-  }
-
-  const resultMatch = clean.match(/([✓✘x])\s+\d+\s+(.+?\.spec\.[jt]s(?::\d+:\d+)?\s+[›>]\s+.+?)\s+\(([^)]+)\)$/i);
-  if (resultMatch) {
-    const symbol = resultMatch[1].toLowerCase();
-    const testName = resultMatch[2].trim();
-    const status = symbol === '✓' ? 'passed' : 'failed';
-    upsertTestResult(testName, status);
-    runState.currentTest = null;
-    runState.currentDetail = null;
-  }
-
-  const okMatch = clean.match(/^ok\s+\d+\s+.+?\s+[›>]\s+(.+?)\s+\(([^)]+)\)$/i);
-  if (okMatch) {
-    upsertTestResult(okMatch[1].trim(), 'passed');
-    runState.currentTest = null;
-    runState.currentDetail = null;
-  }
-
-  const failedMatch = clean.match(/^\d+\)\s+.+?\s+[›>]\s+(.+)$/);
-  if (failedMatch) {
-    upsertTestResult(failedMatch[1].trim(), 'failed');
-    runState.currentTest = null;
-    runState.currentDetail = null;
-  }
 }
 
 function streamOutput(stream, streamName) {
@@ -203,24 +216,103 @@ function streamOutput(stream, streamName) {
   });
 }
 
-function startPlaywrightRun(spec) {
-  const hasSpec = typeof spec === 'string' && spec.trim().length > 0;
-  const targetSpec = hasSpec ? spec.trim() : null;
-  const args = hasSpec
-    ? ['playwright', 'test', targetSpec, '--headed', '--reporter=line']
+function walkSpecFiles(dir) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...walkSpecFiles(full));
+      continue;
+    }
+    if (/\.spec\.[cm]?[jt]s$/i.test(entry.name)) files.push(full);
+  }
+  return files;
+}
+
+function discoverTests() {
+  if (!fs.existsSync(TESTS_DIR)) return [];
+
+  const files = walkSpecFiles(TESTS_DIR).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return files.map((absPath) => {
+    let displayName = path.basename(absPath);
+    let children = [];
+    try {
+      const top = fs.readFileSync(absPath, 'utf8').split(/\r?\n/).slice(0, 30).join('\n');
+      const m = top.match(RUNNER_NAME_RE);
+      if (m && m[1]) displayName = m[1].trim();
+      const childMatch = top.match(RUNNER_CHILDREN_RE);
+      if (childMatch && childMatch[1]) {
+        children = childMatch[1]
+          .split(';')
+          .map((chunk) => chunk.trim())
+          .filter(Boolean)
+          .map((chunk) => {
+            const eq = chunk.indexOf('=');
+            if (eq === -1) return { id: chunk, label: chunk, required: false };
+            const id = chunk.slice(0, eq).trim();
+            const label = chunk.slice(eq + 1).trim();
+            const required = /\(required\)/i.test(label);
+            return { id, label, required };
+          });
+      }
+    } catch {
+      // ignore parsing errors and fallback to filename
+    }
+
+    const rel = path.relative(__dirname, absPath).split(path.sep).join('/');
+    if (!children.length) {
+      children = [{ id: '__self', label: displayName, required: false }];
+    }
+
+    return {
+      id: rel,
+      displayName,
+      children,
+    };
+  });
+}
+
+function startPlaywrightRun(selection) {
+  const selectedSpecs = Array.isArray(selection?.specs)
+    ? selection.specs.map((s) => String(s || '').trim()).filter(Boolean)
+    : (typeof selection === 'string' && selection.trim() ? [selection.trim()] : []);
+  const selectedTasks = Array.isArray(selection?.tasks)
+    ? selection.tasks.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+  const selectedTaskIds = selectedTasks
+    .map((k) => k.split('::')[1] || k)
+    .filter(Boolean);
+  const plannedResults = Array.isArray(selection?.plannedResults) ? selection.plannedResults : [];
+
+  const args = selectedSpecs.length > 0
+    ? ['playwright', 'test', ...selectedSpecs, '--headed', '--reporter=line']
     : ['playwright', 'test', '--headed', '--reporter=line'];
 
   runState = createIdleState({
     running: true,
     startedAt: new Date().toISOString(),
-    currentSpec: targetSpec || 'ALL',
+    currentSpec: selectedSpecs.length > 0 ? selectedSpecs.join(', ') : 'ALL',
+    selectedSpecs,
+    selectedTasks: selectedTaskIds,
+    testResults: plannedResults.map((x) => ({
+      key: x.key,
+      test: x.test,
+      status: 'pending',
+      durationMs: null,
+      error: null,
+      updatedAt: new Date().toISOString(),
+    })),
   });
 
   appendLog(`[runner] Starting Playwright run: npx ${args.join(' ')}`, 'system');
 
   currentChild = spawn('npx', args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: process.env,
+    env: {
+      ...process.env,
+      RUNNER_TASKS: selectedTaskIds.join(','),
+    },
   });
 
   streamOutput(currentChild.stdout, 'stdout');
@@ -313,11 +405,17 @@ const server = http.createServer(async (req, res) => {
       .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
       h1 { margin: 0 0 12px; }
       .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-      input { flex: 1; min-width: 280px; padding: 10px; border: 1px solid #2f3f57; border-radius: 8px; background: #0f1621; color: var(--text); }
       button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 700; }
       button.secondary { background: #334155; }
       button.warn { background: #b91c1c; }
       button:disabled { opacity: 0.65; cursor: not-allowed; }
+      .tests-list { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; max-height: 220px; overflow: auto; background: #0f1621; }
+      .test-parent { border-bottom: 1px solid #1b2535; padding: 8px 10px; }
+      .test-item { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; }
+      .test-children { margin-left: 26px; }
+      .test-main { display: flex; flex-direction: column; gap: 4px; }
+      .test-path { font-size: 12px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .required-note { font-size: 11px; color: #fbbf24; }
       .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; font-weight: 700; font-size: 12px; }
       .running { background: #12233d; color: var(--run); }
       .passed { background: #0f2a1b; color: var(--ok); }
@@ -341,11 +439,14 @@ const server = http.createServer(async (req, res) => {
       <div class="card">
         <h1>Playwright Runner</h1>
         <div class="row">
-          <input id="spec" name="spec" placeholder="Leave blank to run all tests" />
           <button id="run" type="button">Trigger Run</button>
           <button id="stop" type="button" class="warn">Stop Current</button>
           <button id="clear" type="button" class="secondary">Clear</button>
+          <button id="selectAll" type="button" class="secondary">Select All</button>
+          <button id="unselectAll" type="button" class="secondary">Unselect All</button>
+          <span class="muted" id="selectedCount">Selected: 0</span>
         </div>
+        <div id="testsList" class="tests-list muted">Loading tests...</div>
         <div class="row" style="margin-top:10px;">
           <span id="statusBadge" class="badge idle">IDLE</span>
           <span class="muted" id="statusText">Waiting for trigger</span>
@@ -389,10 +490,17 @@ const server = http.createServer(async (req, res) => {
       const runBtn = document.getElementById('run');
       const stopBtn = document.getElementById('stop');
       const clearBtn = document.getElementById('clear');
-      const specInput = document.getElementById('spec');
+      const selectAllBtn = document.getElementById('selectAll');
+      const unselectAllBtn = document.getElementById('unselectAll');
+      const selectedCountEl = document.getElementById('selectedCount');
+      const testsListEl = document.getElementById('testsList');
       const logsPre = document.getElementById('logs');
       const openFailureDetails = new Set();
+      let discoveredTests = [];
+      let selectedTaskKeys = new Set();
       let lastResultsSignature = '';
+      let lastLogsSignature = '';
+      let userPinnedToBottom = true;
 
       function statusClass(state) {
         if (state.running) return 'running';
@@ -400,25 +508,88 @@ const server = http.createServer(async (req, res) => {
         if (typeof state.exitCode === 'number') return state.exitCode === 0 ? 'passed' : 'failed';
         return 'idle';
       }
-
       function statusLabel(state) {
         if (state.running) return 'IN PROGRESS';
         if (state.lastError === 'Run stopped by user') return 'CANCELED';
         if (typeof state.exitCode === 'number') return state.exitCode === 0 ? 'PASSED' : 'FAILED';
         return 'IDLE';
       }
-
-      function safe(v) {
-        return v === null || v === undefined || v === '' ? '-' : String(v);
+      function safe(v) { return v === null || v === undefined || v === '' ? '-' : String(v); }
+      function esc(v) {
+        return safe(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
       }
 
-      function esc(v) {
-        return safe(v)
-          .replaceAll('&', '&amp;')
-          .replaceAll('<', '&lt;')
-          .replaceAll('>', '&gt;')
-          .replaceAll('"', '&quot;')
-          .replaceAll("'", '&#39;');
+      function taskKey(specId, childId) { return specId + '::' + childId; }
+
+      function updateSelectedCount() {
+        selectedCountEl.textContent = 'Selected: ' + selectedTaskKeys.size;
+      }
+
+      function renderTestsChooser() {
+        if (!Array.isArray(discoveredTests) || discoveredTests.length === 0) {
+          testsListEl.innerHTML = '<div class="test-item muted">No tests found.</div>';
+          updateSelectedCount();
+          return;
+        }
+
+        testsListEl.innerHTML = discoveredTests.map((spec) => {
+          const childKeys = spec.children.map((c) => taskKey(spec.id, c.id));
+          const checkedCount = childKeys.filter((k) => selectedTaskKeys.has(k)).length;
+          const parentChecked = checkedCount === childKeys.length;
+          const parentIndeterminate = checkedCount > 0 && checkedCount < childKeys.length;
+          const parentHtml = '<label class="test-item"><input type="checkbox" data-parent="' + esc(spec.id) + '"' + (parentChecked ? ' checked' : '') + '><div class="test-main"><strong>' + esc(spec.displayName) + '</strong></div></label>';
+          const childrenHtml = spec.children.map((child) => {
+            const key = taskKey(spec.id, child.id);
+            const checked = selectedTaskKeys.has(key) ? ' checked' : '';
+            const disabled = child.required ? ' disabled' : '';
+            const note = child.required ? '<span class="required-note">Required - cannot disable</span>' : '';
+            return '<label class="test-item"><input type="checkbox" data-child="' + esc(key) + '"' + checked + disabled + '><div class="test-main"><span>• ' + esc(child.label) + '</span>' + note + '</div></label>';
+          }).join('');
+          return '<div class="test-parent" data-parent-wrap="' + esc(spec.id) + '">' + parentHtml + '<div class="test-children">' + childrenHtml + '</div></div>';
+        }).join('');
+
+        testsListEl.querySelectorAll('input[data-parent]').forEach((input) => {
+          const specId = input.getAttribute('data-parent');
+          const spec = discoveredTests.find((s) => s.id === specId);
+          if (!spec) return;
+          const childKeys = spec.children.map((c) => taskKey(spec.id, c.id));
+          const checkedCount = childKeys.filter((k) => selectedTaskKeys.has(k)).length;
+          input.indeterminate = checkedCount > 0 && checkedCount < childKeys.length;
+
+          input.addEventListener('change', () => {
+            if (input.checked) {
+              spec.children.forEach((c) => selectedTaskKeys.add(taskKey(spec.id, c.id)));
+            } else {
+              spec.children.forEach((c) => {
+                const key = taskKey(spec.id, c.id);
+                if (c.required) selectedTaskKeys.add(key);
+                else selectedTaskKeys.delete(key);
+              });
+            }
+            renderTestsChooser();
+          });
+        });
+
+        testsListEl.querySelectorAll('input[data-child]').forEach((input) => {
+          input.addEventListener('change', () => {
+            const key = input.getAttribute('data-child');
+            if (!key) return;
+            if (input.checked) selectedTaskKeys.add(key);
+            else selectedTaskKeys.delete(key);
+            renderTestsChooser();
+          });
+        });
+
+        updateSelectedCount();
+      }
+
+      async function loadTests() {
+        const res = await fetch('/tests');
+        const data = await res.json();
+        discoveredTests = Array.isArray(data.tests) ? data.tests : [];
+        selectedTaskKeys = new Set();
+        discoveredTests.forEach((spec) => spec.children.forEach((child) => selectedTaskKeys.add(taskKey(spec.id, child.id))));
+        renderTestsChooser();
       }
 
       function renderResults(results) {
@@ -429,50 +600,41 @@ const server = http.createServer(async (req, res) => {
         }
 
         tbody.innerHTML = results.map((r) => {
-          const cls = r.status === 'passed' ? 'passed' : r.status === 'failed' ? 'failed' : r.status === 'canceled' ? 'canceled' : 'running';
-          const rawKey = safe(r.test);
+          const cls = r.status === 'passed' ? 'passed' : r.status === 'failed' ? 'failed' : r.status === 'canceled' ? 'canceled' : r.status === 'pending' ? 'idle' : 'running';
+          const rawKey = safe(r.key);
           const encodedKey = encodeURIComponent(rawKey);
           const isOpen = openFailureDetails.has(rawKey);
-          const errorHtml = r.error
-            ? '<details data-failure-key="' + encodedKey + '"' + (isOpen ? ' open' : '') + '><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>'
-            : '';
-
-          return '<tr>' +
-            '<td class="mono">' + esc(r.test) + errorHtml + '</td>' +
-            '<td><span class="badge ' + cls + '">' + esc(r.status).toUpperCase() + '</span></td>' +
-            '<td class="mono">' + esc(r.durationMs) + '</td>' +
-            '</tr>';
+          const errorHtml = r.error ? '<details data-failure-key="' + encodedKey + '"' + (isOpen ? ' open' : '') + '><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>' : '';
+          const indent = r.parent ? '<span class="muted">- </span>' : '';
+          return '<tr><td>' + indent + esc(r.test) + errorHtml + '</td><td><span class="badge ' + cls + '">' + esc(r.status).toUpperCase() + '</span></td><td class="mono">' + esc(r.durationMs) + '</td></tr>';
         }).join('');
       }
 
       function renderLogs(logs) {
         if (!Array.isArray(logs) || logs.length === 0) {
-          logsPre.textContent = 'No logs yet.';
+          const emptySig = 'EMPTY';
+          if (lastLogsSignature !== emptySig) {
+            logsPre.textContent = 'No logs yet.';
+            lastLogsSignature = emptySig;
+          }
           return;
         }
-        logsPre.textContent = logs.map((l) => '[' + l.ts + '][' + l.stream + '] ' + l.line).join('\\n');
-        logsPre.scrollTop = logsPre.scrollHeight;
+        const nextText = logs.map((l) => '[' + l.ts + '][' + l.stream + '] ' + l.line).join('\\n');
+        if (nextText === lastLogsSignature) return;
+        logsPre.textContent = nextText;
+        lastLogsSignature = nextText;
+        if (userPinnedToBottom) {
+          logsPre.scrollTop = logsPre.scrollHeight;
+        }
       }
 
       async function refreshStatus() {
-        let data;
-        try {
-          const res = await fetch('/status');
-          data = await res.json();
-        } catch (err) {
-          statusBadge.className = 'badge failed';
-          statusBadge.textContent = 'ERROR';
-          statusText.textContent = 'Failed to fetch status: ' + (err && err.message ? err.message : err);
-          return;
-        }
-
+        const res = await fetch('/status');
+        const data = await res.json();
         const cls = statusClass(data);
         statusBadge.className = 'badge ' + cls;
         statusBadge.textContent = statusLabel(data);
-        statusText.textContent = data.running
-          ? ('Running: ' + safe(data.currentTest) + ' | ' + safe(data.currentDetail))
-          : ('Last run exit code: ' + safe(data.exitCode));
-
+        statusText.textContent = data.running ? ('Running: ' + safe(data.currentTest) + ' | ' + safe(data.currentDetail)) : ('Last run exit code: ' + safe(data.exitCode));
         document.getElementById('currentSpec').textContent = safe(data.currentSpec);
         document.getElementById('currentTest').textContent = safe(data.currentTest);
         document.getElementById('currentDetail').textContent = safe(data.currentDetail);
@@ -480,85 +642,87 @@ const server = http.createServer(async (req, res) => {
         document.getElementById('finishedAt').textContent = safe(data.finishedAt);
         document.getElementById('exitCode').textContent = safe(data.exitCode);
         document.getElementById('lastError').textContent = safe(data.lastError);
-
-        const nextResultsSignature = JSON.stringify(data.testResults || []);
-        if (nextResultsSignature !== lastResultsSignature) {
+        const sig = JSON.stringify(data.testResults || []);
+        if (sig !== lastResultsSignature) {
           renderResults(data.testResults);
-          lastResultsSignature = nextResultsSignature;
+          lastResultsSignature = sig;
         }
         renderLogs(data.logs);
-
         runBtn.disabled = !!data.running;
         stopBtn.disabled = !data.running;
         clearBtn.disabled = !!data.running;
+        selectAllBtn.disabled = !!data.running;
+        unselectAllBtn.disabled = !!data.running;
+      }
+
+      function buildSelectionPayload() {
+        const tasks = Array.from(selectedTaskKeys);
+        const specsSet = new Set(tasks.map((key) => key.split('::')[0]));
+        const specs = Array.from(specsSet);
+        const plannedResults = tasks.map((key) => {
+          const [specId, childId] = key.split('::');
+          const spec = discoveredTests.find((s) => s.id === specId);
+          const child = spec ? spec.children.find((c) => c.id === childId) : null;
+          const parent = spec ? spec.displayName : specId;
+          const label = child ? child.label : key;
+          return { key, test: parent + ' > ' + label, parent: childId !== '__self' };
+        });
+        return { specs, tasks, plannedResults };
       }
 
       async function trigger() {
+        const payload = buildSelectionPayload();
+        if (payload.tasks.length === 0) {
+          alert('Select at least one test first.');
+          return;
+        }
         runBtn.disabled = true;
-        const originalText = runBtn.textContent;
+        const original = runBtn.textContent;
         runBtn.textContent = 'Starting...';
-        statusText.textContent = 'Sending trigger request...';
-
-        const spec = specInput.value.trim();
-        const query = spec ? ('?spec=' + encodeURIComponent(spec)) : '';
-
         try {
-          const res = await fetch('/trigger' + query);
+          const res = await fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
           const data = await res.json();
-          if (!res.ok) {
-            statusText.textContent = data.message || 'Failed to trigger run';
-            alert(data.message || 'Failed to trigger run');
-          } else {
-            statusText.textContent = 'Run triggered. Waiting for runner state...';
-          }
-        } catch (err) {
-          const msg = 'Trigger request failed: ' + (err && err.message ? err.message : err);
-          statusText.textContent = msg;
-          alert(msg);
+          if (!res.ok) alert(data.message || 'Failed to trigger run');
         } finally {
-          runBtn.textContent = originalText;
+          runBtn.textContent = original;
           await refreshStatus();
         }
       }
 
-      async function stopRun() {
-        try {
-          const res = await fetch('/stop');
-          const data = await res.json();
-          if (!res.ok) alert(data.message || 'Failed to stop run');
-        } catch (err) {
-          alert('Stop request failed: ' + (err && err.message ? err.message : err));
-        } finally {
-          await refreshStatus();
-        }
-      }
-
-      async function clearState() {
-        try {
-          const res = await fetch('/clear');
-          const data = await res.json();
-          if (!res.ok) alert(data.message || 'Failed to clear state');
-        } catch (err) {
-          alert('Clear request failed: ' + (err && err.message ? err.message : err));
-        } finally {
-          await refreshStatus();
-        }
-      }
+      async function stopRun() { await fetch('/stop'); await refreshStatus(); }
+      async function clearState() { await fetch('/clear'); await refreshStatus(); }
 
       runBtn.addEventListener('click', trigger);
       stopBtn.addEventListener('click', stopRun);
       clearBtn.addEventListener('click', clearState);
+      selectAllBtn.addEventListener('click', () => {
+        selectedTaskKeys = new Set();
+        discoveredTests.forEach((spec) => spec.children.forEach((child) => selectedTaskKeys.add(taskKey(spec.id, child.id))));
+        renderTestsChooser();
+      });
+      unselectAllBtn.addEventListener('click', () => {
+        selectedTaskKeys = new Set();
+        discoveredTests.forEach((spec) => spec.children.forEach((child) => { if (child.required) selectedTaskKeys.add(taskKey(spec.id, child.id)); }));
+        renderTestsChooser();
+      });
       document.addEventListener('toggle', (event) => {
         const detailsEl = event.target;
         if (!detailsEl || detailsEl.tagName !== 'DETAILS') return;
         const key = detailsEl.getAttribute('data-failure-key');
         if (!key) return;
         const decodedKey = decodeURIComponent(key);
-        if (detailsEl.open) openFailureDetails.add(decodedKey);
-        else openFailureDetails.delete(decodedKey);
+        if (detailsEl.open) openFailureDetails.add(decodedKey); else openFailureDetails.delete(decodedKey);
       });
-      refreshStatus();
-      setInterval(refreshStatus, 500);
+      logsPre.addEventListener('scroll', () => {
+        const distanceFromBottom = logsPre.scrollHeight - logsPre.scrollTop - logsPre.clientHeight;
+        userPinnedToBottom = distanceFromBottom < 16;
+      });
+
+      (async () => {
+        await loadTests();
+        await refreshStatus();
+        setInterval(refreshStatus, 500);
+      })();
     </script>
   </body>
 </html>`
@@ -571,10 +735,17 @@ const server = http.createServer(async (req, res) => {
       ...runState,
       usage: {
         triggerAll: `curl -X POST http://${HOST}:${PORT}/trigger`,
-        triggerWithSpec: `curl -X POST http://${HOST}:${PORT}/trigger -H "Content-Type: application/json" -d '{"spec":"${EXAMPLE_SPEC}"}'`,
+        triggerWithSpec: `curl -X POST http://${HOST}:${PORT}/trigger -H "Content-Type: application/json" -d '{"specs":["${EXAMPLE_SPEC}"]}'`,
         stop: `curl http://${HOST}:${PORT}/stop`,
         clear: `curl http://${HOST}:${PORT}/clear`,
       },
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/tests') {
+    return sendJson(res, 200, {
+      ok: true,
+      tests: discoverTests(),
     });
   }
 
@@ -583,7 +754,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 409, { ok: false, message: 'A Playwright run is already in progress.', state: runState });
     }
     const spec = url.searchParams.get('spec') || '';
-    startPlaywrightRun(spec);
+    startPlaywrightRun({ specs: spec ? [spec] : [] });
     return sendJson(res, 202, { ok: true, message: 'Playwright run started.', spec: spec || 'ALL' });
   }
 
@@ -594,9 +765,27 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const body = await parseJsonBody(req);
-      const spec = typeof body.spec === 'string' && body.spec.trim() ? body.spec.trim() : '';
-      startPlaywrightRun(spec);
-      return sendJson(res, 202, { ok: true, message: 'Playwright run started.', spec: spec || 'ALL' });
+      const requestedSpecs = Array.isArray(body.specs)
+        ? body.specs.map((s) => String(s || '').trim()).filter(Boolean)
+        : (typeof body.spec === 'string' && body.spec.trim() ? [body.spec.trim()] : []);
+      const requestedTasks = Array.isArray(body.tasks)
+        ? body.tasks.map((s) => String(s || '').trim()).filter(Boolean)
+        : [];
+      const plannedResults = Array.isArray(body.plannedResults) ? body.plannedResults : [];
+
+      const availableTests = discoverTests();
+      const availableIds = new Set(availableTests.map((t) => t.id));
+      const invalidSpecs = requestedSpecs.filter((s) => !availableIds.has(s));
+      if (invalidSpecs.length > 0) {
+        return sendJson(res, 400, { ok: false, message: `Unknown test ids: ${invalidSpecs.join(', ')}` });
+      }
+
+      startPlaywrightRun({ specs: requestedSpecs, tasks: requestedTasks, plannedResults });
+      return sendJson(res, 202, {
+        ok: true,
+        message: 'Playwright run started.',
+        specs: requestedSpecs.length > 0 ? requestedSpecs : ['ALL'],
+      });
     } catch (err) {
       return sendJson(res, 400, { ok: false, message: err.message });
     }
@@ -616,7 +805,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       message: 'Runner is alive.',
-      endpoints: ['GET /status', 'GET /ui', 'GET /trigger', 'POST /trigger', 'GET /stop', 'GET /clear'],
+      endpoints: ['GET /status', 'GET /tests', 'GET /ui', 'GET /trigger', 'POST /trigger', 'GET /stop', 'GET /clear'],
     });
   }
 
