@@ -3,7 +3,7 @@ const { spawn } = require('child_process');
 
 const HOST = '127.0.0.1';
 const PORT = 5050;
-const EXAMPLE_SPEC = 'tests/2. Regression/navigation.spec.js';
+const EXAMPLE_SPEC = 'tests/2. Regression/10-navigation.spec.js';
 const MAX_LOG_LINES = 2000;
 
 let currentChild = null;
@@ -391,6 +391,8 @@ const server = http.createServer(async (req, res) => {
       const clearBtn = document.getElementById('clear');
       const specInput = document.getElementById('spec');
       const logsPre = document.getElementById('logs');
+      const openFailureDetails = new Set();
+      let lastResultsSignature = '';
 
       function statusClass(state) {
         if (state.running) return 'running';
@@ -428,8 +430,11 @@ const server = http.createServer(async (req, res) => {
 
         tbody.innerHTML = results.map((r) => {
           const cls = r.status === 'passed' ? 'passed' : r.status === 'failed' ? 'failed' : r.status === 'canceled' ? 'canceled' : 'running';
+          const rawKey = safe(r.test);
+          const encodedKey = encodeURIComponent(rawKey);
+          const isOpen = openFailureDetails.has(rawKey);
           const errorHtml = r.error
-            ? '<details><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>'
+            ? '<details data-failure-key="' + encodedKey + '"' + (isOpen ? ' open' : '') + '><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>'
             : '';
 
           return '<tr>' +
@@ -476,7 +481,11 @@ const server = http.createServer(async (req, res) => {
         document.getElementById('exitCode').textContent = safe(data.exitCode);
         document.getElementById('lastError').textContent = safe(data.lastError);
 
-        renderResults(data.testResults);
+        const nextResultsSignature = JSON.stringify(data.testResults || []);
+        if (nextResultsSignature !== lastResultsSignature) {
+          renderResults(data.testResults);
+          lastResultsSignature = nextResultsSignature;
+        }
         renderLogs(data.logs);
 
         runBtn.disabled = !!data.running;
@@ -539,6 +548,15 @@ const server = http.createServer(async (req, res) => {
       runBtn.addEventListener('click', trigger);
       stopBtn.addEventListener('click', stopRun);
       clearBtn.addEventListener('click', clearState);
+      document.addEventListener('toggle', (event) => {
+        const detailsEl = event.target;
+        if (!detailsEl || detailsEl.tagName !== 'DETAILS') return;
+        const key = detailsEl.getAttribute('data-failure-key');
+        if (!key) return;
+        const decodedKey = decodeURIComponent(key);
+        if (detailsEl.open) openFailureDetails.add(decodedKey);
+        else openFailureDetails.delete(decodedKey);
+      });
       refreshStatus();
       setInterval(refreshStatus, 500);
     </script>
