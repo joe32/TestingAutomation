@@ -5,6 +5,7 @@ const { spawn } = require('child_process');
 
 const HOST = '127.0.0.1';
 const PORT = 5050;
+const DEFAULT_BASE_DOMAIN = 'app.bullet-ai.com';
 const EXAMPLE_SPEC = 'tests/2. Regression/10-navigation.spec.js';
 const MAX_LOG_LINES = 2000;
 const TESTS_DIR = path.join(__dirname, 'tests');
@@ -26,6 +27,7 @@ function createIdleState(overrides = {}) {
     selectedTasks: [],
     currentTest: null,
     currentDetail: null,
+    baseDomain: DEFAULT_BASE_DOMAIN,
     testResults: [],
     logs: [],
     ...overrides,
@@ -65,6 +67,19 @@ function parseJsonBody(req) {
 
 function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function normalizeBaseDomain(rawValue) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return DEFAULT_BASE_DOMAIN;
+
+  let normalized = raw.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  if (!normalized) normalized = DEFAULT_BASE_DOMAIN;
+
+  if (/[/?#\s]/.test(normalized)) {
+    throw new Error('Base domain must be host only (example: app.bullet-ai.com)');
+  }
+  return normalized;
 }
 
 function appendLog(line, stream = 'stdout') {
@@ -306,6 +321,8 @@ function startPlaywrightRun(selection) {
     .map((k) => k.split('::')[1] || k)
     .filter(Boolean);
   const plannedResults = Array.isArray(selection?.plannedResults) ? selection.plannedResults : [];
+  const baseDomain = normalizeBaseDomain(selection?.baseDomain);
+  const baseUrl = `https://${baseDomain}/`;
 
   const args = selectedSpecs.length > 0
     ? ['playwright', 'test', ...selectedSpecs, '--headed', '--reporter=line']
@@ -315,6 +332,7 @@ function startPlaywrightRun(selection) {
     running: true,
     startedAt: new Date().toISOString(),
     currentSpec: selectedSpecs.length > 0 ? selectedSpecs.join(', ') : 'ALL',
+    baseDomain,
     selectedSpecs,
     selectedTasks: selectedTaskIds,
     testResults: plannedResults.map((x) => ({
@@ -328,6 +346,7 @@ function startPlaywrightRun(selection) {
   });
 
   appendLog(`[runner] Starting Playwright run: npx ${args.join(' ')}`, 'system');
+  appendLog(`[runner] Base URL: ${baseUrl}`, 'system');
   subtestTimers.clear();
 
   currentChild = spawn('npx', args, {
@@ -335,6 +354,7 @@ function startPlaywrightRun(selection) {
     env: {
       ...process.env,
       RUNNER_TASKS: selectedTaskIds.join(','),
+      PLAYWRIGHT_BASE_URL: baseUrl,
     },
   });
 
@@ -464,6 +484,8 @@ const server = http.createServer(async (req, res) => {
       <div class="card">
         <h1>Playwright Runner</h1>
         <div class="row">
+          <label for="baseDomainInput" class="muted" style="font-weight:700;">Base domain</label>
+          <input id="baseDomainInput" type="text" value="${DEFAULT_BASE_DOMAIN}" style="background:#0f1621;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:220px;" />
           <button id="run" type="button">Trigger Run</button>
           <button id="stop" type="button" class="warn">Stop Current</button>
           <button id="clear" type="button" class="secondary">Clear</button>
@@ -518,6 +540,7 @@ const server = http.createServer(async (req, res) => {
       const selectAllBtn = document.getElementById('selectAll');
       const unselectAllBtn = document.getElementById('unselectAll');
       const selectedCountEl = document.getElementById('selectedCount');
+      const baseDomainInput = document.getElementById('baseDomainInput');
       const testsListEl = document.getElementById('testsList');
       const logsPre = document.getElementById('logs');
       const openFailureDetails = new Set();
@@ -667,6 +690,9 @@ const server = http.createServer(async (req, res) => {
         document.getElementById('finishedAt').textContent = safe(data.finishedAt);
         document.getElementById('exitCode').textContent = safe(data.exitCode);
         document.getElementById('lastError').textContent = safe(data.lastError);
+        if (data.baseDomain && !baseDomainInput.matches(':focus')) {
+          baseDomainInput.value = String(data.baseDomain);
+        }
         const sig = JSON.stringify(data.testResults || []);
         if (sig !== lastResultsSignature) {
           renderResults(data.testResults);
@@ -678,12 +704,14 @@ const server = http.createServer(async (req, res) => {
         clearBtn.disabled = !!data.running;
         selectAllBtn.disabled = !!data.running;
         unselectAllBtn.disabled = !!data.running;
+        baseDomainInput.disabled = !!data.running;
       }
 
       function buildSelectionPayload() {
         const tasks = Array.from(selectedTaskKeys);
         const specsSet = new Set(tasks.map((key) => key.split('::')[0]));
         const specs = Array.from(specsSet);
+        const baseDomain = (baseDomainInput.value || '').trim();
         const plannedResults = tasks.map((key) => {
           const [specId, childId] = key.split('::');
           const spec = discoveredTests.find((s) => s.id === specId);
@@ -692,7 +720,7 @@ const server = http.createServer(async (req, res) => {
           const label = child ? child.label : key;
           return { key, test: parent + ' > ' + label, parent: childId !== '__self' };
         });
-        return { specs, tasks, plannedResults };
+        return { specs, tasks, plannedResults, baseDomain };
       }
 
       async function trigger() {
@@ -761,6 +789,7 @@ const server = http.createServer(async (req, res) => {
       usage: {
         triggerAll: `curl -X POST http://${HOST}:${PORT}/trigger`,
         triggerWithSpec: `curl -X POST http://${HOST}:${PORT}/trigger -H "Content-Type: application/json" -d '{"specs":["${EXAMPLE_SPEC}"]}'`,
+        baseDomain: `optional in POST body, defaults to ${DEFAULT_BASE_DOMAIN}`,
         stop: `curl http://${HOST}:${PORT}/stop`,
         clear: `curl http://${HOST}:${PORT}/clear`,
       },
@@ -779,8 +808,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 409, { ok: false, message: 'A Playwright run is already in progress.', state: runState });
     }
     const spec = url.searchParams.get('spec') || '';
-    startPlaywrightRun({ specs: spec ? [spec] : [] });
-    return sendJson(res, 202, { ok: true, message: 'Playwright run started.', spec: spec || 'ALL' });
+    const baseDomain = normalizeBaseDomain(url.searchParams.get('baseDomain') || DEFAULT_BASE_DOMAIN);
+    startPlaywrightRun({ specs: spec ? [spec] : [], baseDomain });
+    return sendJson(res, 202, { ok: true, message: 'Playwright run started.', spec: spec || 'ALL', baseDomain });
   }
 
   if (req.method === 'POST' && url.pathname === '/trigger') {
@@ -797,6 +827,7 @@ const server = http.createServer(async (req, res) => {
         ? body.tasks.map((s) => String(s || '').trim()).filter(Boolean)
         : [];
       const plannedResults = Array.isArray(body.plannedResults) ? body.plannedResults : [];
+      const baseDomain = normalizeBaseDomain(body.baseDomain);
 
       const availableTests = discoverTests();
       const availableIds = new Set(availableTests.map((t) => t.id));
@@ -805,11 +836,12 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { ok: false, message: `Unknown test ids: ${invalidSpecs.join(', ')}` });
       }
 
-      startPlaywrightRun({ specs: requestedSpecs, tasks: requestedTasks, plannedResults });
+      startPlaywrightRun({ specs: requestedSpecs, tasks: requestedTasks, plannedResults, baseDomain });
       return sendJson(res, 202, {
         ok: true,
         message: 'Playwright run started.',
         specs: requestedSpecs.length > 0 ? requestedSpecs : ['ALL'],
+        baseDomain,
       });
     } catch (err) {
       return sendJson(res, 400, { ok: false, message: err.message });

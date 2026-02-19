@@ -5,7 +5,7 @@ module.exports = defineConfig({
   testDir: './tests',
   workers: 1,
   use: {
-    baseURL: 'https://app.bullet-ai.com/',
+    baseURL: process.env.PLAYWRIGHT_BASE_URL || 'https://app.bullet-ai.com/',
     headless: false,
   },
 });
