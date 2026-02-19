@@ -12,6 +12,7 @@ const RUNNER_NAME_RE = /@runner-name:\s*(.+)$/im;
 const RUNNER_CHILDREN_RE = /@runner-children:\s*(.+)$/im;
 
 let currentChild = null;
+const subtestTimers = new Map();
 
 function createIdleState(overrides = {}) {
   return {
@@ -76,9 +77,11 @@ function appendLog(line, stream = 'stdout') {
 
 function upsertTestResult(key, status, durationMs, error, testNameOverride) {
   const idx = runState.testResults.findIndex((x) => x.key === key);
+  const existing = idx >= 0 ? runState.testResults[idx] : null;
+  const resolvedTestName = testNameOverride || (existing && existing.test) || key;
   const updated = {
     key,
-    test: testNameOverride || key,
+    test: resolvedTestName,
     status,
     durationMs:
       typeof durationMs === 'number'
@@ -145,7 +148,8 @@ function parseE2EEvent(cleanLine) {
       const label = evt.subtestName || evt.subtestId;
       runState.currentTest = label;
       runState.currentDetail = `Running ${label}`;
-      upsertTestResult(key, 'running', null, null, label);
+      subtestTimers.set(key, Date.now());
+      upsertTestResult(key, 'running');
       return true;
     }
 
@@ -153,7 +157,15 @@ function parseE2EEvent(cleanLine) {
       const specId = extractSpecIdFromEventTest(evt.test);
       const key = `${specId || evt.test}::${evt.subtestId}`;
       const mapped = evt.status === 'passed' ? 'passed' : evt.status === 'skipped' ? 'canceled' : 'failed';
-      upsertTestResult(key, mapped, typeof evt.durationMs === 'number' ? evt.durationMs : null, evt.error || null);
+      const startedAt = subtestTimers.get(key);
+      const calculatedDuration = typeof startedAt === 'number' ? (Date.now() - startedAt) : null;
+      subtestTimers.delete(key);
+      upsertTestResult(
+        key,
+        mapped,
+        typeof evt.durationMs === 'number' ? evt.durationMs : calculatedDuration,
+        evt.error || null
+      );
       return true;
     }
 
@@ -169,6 +181,16 @@ function parseE2EEvent(cleanLine) {
           if (!String(r.key || '').startsWith(`${specId}::`)) return r;
           if (String(r.key).endsWith('::__self')) return r;
           if (r.status !== 'pending' && r.status !== 'running') return r;
+
+          // If the test fails, only the already-executing failed subtest should be FAILED.
+          // Subtests that never started are CANCELED.
+          if (mapped === 'failed') {
+            if (r.status === 'pending') {
+              return { ...r, status: 'canceled' };
+            }
+            return { ...r, status: 'failed', error: evt.error || r.error || null };
+          }
+
           return { ...r, status: mapped, error: mapped === 'failed' ? (evt.error || r.error || null) : r.error };
         });
       }
@@ -306,6 +328,7 @@ function startPlaywrightRun(selection) {
   });
 
   appendLog(`[runner] Starting Playwright run: npx ${args.join(' ')}`, 'system');
+  subtestTimers.clear();
 
   currentChild = spawn('npx', args, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -360,6 +383,7 @@ function stopCurrentRun() {
     runState.currentTest = null;
     runState.currentDetail = null;
     finalizeAnyRunningTests('canceled');
+    subtestTimers.clear();
     appendLog('[runner] Run stopped by user', 'system');
     return { ok: true, message: 'Run stop requested.' };
   } catch (err) {
@@ -372,6 +396,7 @@ function clearRunnerState() {
     return { ok: false, message: 'Cannot clear while a run is active. Stop it first.' };
   }
   runState = createIdleState();
+  subtestTimers.clear();
   return { ok: true, message: 'Runner state cleared.' };
 }
 
@@ -605,8 +630,8 @@ const server = http.createServer(async (req, res) => {
           const encodedKey = encodeURIComponent(rawKey);
           const isOpen = openFailureDetails.has(rawKey);
           const errorHtml = r.error ? '<details data-failure-key="' + encodedKey + '"' + (isOpen ? ' open' : '') + '><summary>Show failure reason</summary><div class="error-box mono">' + esc(r.error) + '</div></details>' : '';
-          const indent = r.parent ? '<span class="muted">- </span>' : '';
-          return '<tr><td>' + indent + esc(r.test) + errorHtml + '</td><td><span class="badge ' + cls + '">' + esc(r.status).toUpperCase() + '</span></td><td class="mono">' + esc(r.durationMs) + '</td></tr>';
+          const label = r.parent ? ('&nbsp;&nbsp;&nbsp;&nbsp;↳ ' + esc(r.test)) : ('<strong>' + esc(r.test) + '</strong>');
+          return '<tr><td>' + label + errorHtml + '</td><td><span class="badge ' + cls + '">' + esc(r.status).toUpperCase() + '</span></td><td class="mono">' + esc(r.durationMs) + '</td></tr>';
         }).join('');
       }
 
